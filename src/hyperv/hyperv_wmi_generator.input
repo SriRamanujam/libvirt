@@ -1088,22 +1088,50 @@ class Msvm_Keyboard_2012
 end
 
 class Msvm_DiskDrive
+    uint16   AdditionalAvailability
+    uint16   Availability
+    uint16   Capabilities[]
+    string   CapabilityDescriptions[]
+    string   Caption
+    string   CompressionMethod
     string   CreationClassName
-    string   Name
-    string   PrimaryOwnerContact
-    string   PrimaryOwnerName
-    string   Roles[]
-    string   NameFormat
-    string   OtherIdentifyingInfo[]
-    string   IdentifyingDescriptions[]
-    uint16   Dedicated[]
-    string   OtherDedicatedDescriptions[]
-    uint16   ResetCapability
+    uint64   DefaultBlockSize
+    string   Description
+    string   DeviceID
     uint32   DriveNumber
-    uint16   PowerManagementCapabilities[]
-    string   ScopeOfResidence
-    uint32   NumLearnableAddresses
-    uint32   MaxVMQOffloads
-    uint32   MaxChimneyOffloads
+    string   ElementName
+    uint16   EnabledDefault
+    uint16   EnabledState
+    boolean  ErrorCleared
+    string   ErrorDescription
+    string   ErrorMethodology
+    uint16   HealthState
+    string   IdentifyingDescriptions[]
+    datetime InstallDate
+    datetime LastCleaned
+    uint32   LastErrorCode
+    uint64   LoadTime
+    uint16   LocationIndicator
+    uint64   MaxAccessTime
+    uint64   MaxBlockSize
+    uint64   MaxMediaSize
+    uint64   MaxUnitsBeforeCleaning
+    boolean  MediaIsLocked
+    uint64   MinBlockSize
+    uint64   MountCount
+    string   Name
+    boolean  NeedsCleaning
+    uint32   NumberOfMediaSupported
+    uint16   OperationalStatus
+    string   OtherEnabledState
+    uint16   RequestedState
+    uint16   Security
+    string   StatusDescriptions[]
+    string   SystemCreationClassName
+    string   SystemName
+    datetime TimeOfLastStateChange
+    uint64   TotalMountTime
+    uint64   UnitsUsed
+    uint64   UnloadTime
 end
 
