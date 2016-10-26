@@ -1131,7 +1131,7 @@ hypervParseDomainDefDisk(
             }
         } else {
             if (virDomainDiskSetSource(disk, "-1") < 0) { // No disk selected
-                goto cleanup; 
+                goto cleanup;
             }
         }
 
@@ -1144,6 +1144,157 @@ hypervParseDomainDefDisk(
 
     cleanup:
         return result;
+}
+
+/*
+ * Parses the WMI object for a serial port in order to set the source path
+ * according to the host-side named pipe.
+ */
+static int
+hypervParseDomainDefSerialSrc(virDomainChrSourceDefPtr src,
+        Msvm_ResourceAllocationSettingData *rasdEntry)
+{
+    int result = -1;
+    char **conn;
+
+    /* Hyper-V only lets the host expose named pipes as COM devices */
+    src->type = VIR_DOMAIN_CHR_TYPE_PIPE;
+
+    /* If there are no connections, return a value to indicate as such. */
+    if (rasdEntry->data->Connection.count < 1) {
+        VIR_DEBUG("Connection string is empty");
+        result = 0; /* 0 means port is unused and should not be serialized */
+        goto cleanup;
+    }
+
+    conn = rasdEntry->data->Connection.data;
+
+    if (*conn == NULL) {
+        VIR_DEBUG("Connection string is blank");
+        result = 0;
+        goto cleanup;
+    }
+
+    if (VIR_STRDUP(src->data.file.path, *conn) < 0) {
+        VIR_FREE(conn);
+        goto cleanup;
+    }
+
+    /* 1 is success */
+    result = 1;
+
+cleanup:
+    return result;
+}
+
+/**
+ * Parses the ElementName property of a serial port object in order to set
+ * the target port number to be the same as the COM port number it represents.
+ */
+static int
+hypervParseDomainDefSerialCOMPort(
+        virDomainChrDefPtr dev, Msvm_ResourceAllocationSettingData *rasdEntry)
+{
+    int result = -1;
+    char *elementName = NULL;
+
+    elementName = rasdEntry->data->ElementName;
+    /* Assuming the string is of the form "COM 1", "COM 2", etc. this will get
+     * the int corresponding to that particular number character.
+     * Guaranteed by ASCII and Unicode specs to always work.
+     */
+    int num = elementName[4] - '0';
+    if (num < 1)
+        goto error;
+
+    dev->target.port = num;
+    result = 0;
+
+error:
+    return result;
+}
+
+/**
+ * This parses the RASD entry for resource type 17 (Microsoft Virtual Serial
+ * Port). Serial ports are pretty straightforward: all the needed information
+ * is present in the ResourceAllocationSettingData, so there's no need to
+ * cross-reference other WMI objects in order to build the definition.
+ *
+ * This implementation uses the 'Connection' and 'ElementName' properties in
+ * order to set the source path and target port, respectively. The 'Connection'
+ * property is parsed and set as the <source path=..> element. The 'ElementName'
+ * property is parsed and used to find and set the target port number, so that
+ * it corresponds to the COM port number assigned by Hyper-V.
+ *
+ * RASD entry hierarchy
+ * --------------------
+ * Serial controller (type 13)
+ * `-- Serial port (type 17)
+ *
+ * Example RASD entry (shortened)
+ * ------------------------------
+ *
+ * instance of Msvm_ResourceAllocationSettingData
+ * {
+ *  ...
+ *  Connection = {"\\\\.\\pipe\\host-side-named-pipe"};
+ *  ElementName = "COM 1";
+ *  InstanceID = "Microsoft:5E855AD2-5FD1-457E-A757-E48D7EC66072\\8E3A359F-
+ *                559A-4B6A-98A9-1690A6100ED7\\0";
+ *  ResourceType = 17;
+ *  ...
+ * }
+ *
+ * instance of Msvm_ResourceAllocationSettingData
+ * {
+ *  ...
+ *  Caption = "Serial Controller";
+ *  InstanceID = "Microsoft:5E855AD2-5FD1-457E-A757-E48D7EC66072\\8E3A359F-
+ *                559A-4B6A-98A9-1690A6100ED7";
+ *  ResourceType = 13;
+ *  ...
+ * }
+ */
+static int
+hypervParseDomainDefSerial(virDomainDefPtr def,
+        Msvm_ResourceAllocationSettingData *rasdEntry)
+{
+    int result = -1;
+    int srcRet = -2;
+    virDomainChrDefPtr serial = NULL;
+
+    VIR_DEBUG("Parsing device 'serial' (type %d)",
+            rasdEntry->data->ResourceType);
+
+    serial = virDomainChrDefNew(NULL);
+
+    /* we have all the necessary information, so just build the definition. */
+    serial->deviceType = VIR_DOMAIN_CHR_DEVICE_TYPE_SERIAL;
+
+    /* set up source definition */
+    srcRet = hypervParseDomainDefSerialSrc(serial->source, rasdEntry);
+    if (srcRet < 0) {
+        goto error;
+    }
+    if (srcRet == 0) {
+        goto success;
+    }
+
+    /* Parse the COM port number, set that as the port number */
+    if (hypervParseDomainDefSerialCOMPort(serial, rasdEntry) < 0) {
+        goto error;
+    }
+
+    if (VIR_APPEND_ELEMENT(def->serials, def->nserials, serial) < 0) {
+        virDomainChrDefFree(serial);
+        goto error;
+    }
+
+success:
+    result = 0;
+
+error:
+    return result;
 }
 
 /**
@@ -1272,8 +1423,13 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
         goto cleanup;
     }
 
+    if (VIR_ALLOC_N(def->serials, 40) < 0) {
+        goto cleanup;
+    }
+
     def->ndisks = 0;
     def->ncontrollers = 0;
+    def->nserials = 0;
     
     /* Loop over all VM resources (RASD entries), and parse them depending
      * on the resource type. 
@@ -1303,6 +1459,12 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
                                          rasdEntryListStart,
                                          &scsiDriveIndex) < 0) {
                 
+                goto cleanup;
+            }
+        } else if (resourceType ==
+                MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_SERIAL_PORT) {
+            /* Get serial port */
+            if (hypervParseDomainDefSerial(def, rasdEntry) < 0) {
                 goto cleanup;
             }
         }
