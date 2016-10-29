@@ -1142,8 +1142,8 @@ hypervParseDomainDefDisk(
 
     result = 0;
 
-    cleanup:
-        return result;
+cleanup:
+    return result;
 }
 
 /*
@@ -1298,6 +1298,149 @@ error:
 }
 
 /**
+ * This parses Msvm_SyntheticEthernetPortSettingData entries (resource type 10).
+ * This object provides half of what you need to create the XML; the other half
+ * is in the Msvm_VirtualSwitch object that this virtual adapter is connected
+ * to. To fetch that, we must hop from this object to its corresponding
+ * Msvm_VirtualPort, and from there on to the Msvm_VirtualSwitch.
+ *
+ * This implementation currently parses out the MAC address and bridge name.
+ * The 'Address' property is parsed into the <mac address=..> tag.
+ *
+ * All connections are serialized as being bridged, because as far as I can tell
+ * that's what Microsoft is modeling on the host (similar to how ESX does it).
+ * We get this information from the 'ElementName' property of the VirtualSwitch,
+ * and place it into the <source bridge=..> tag.
+ *
+ * Entry hierarchy
+ * ---------------
+ * Msvm_SyntheticEthernetPortSettingsData (type 10)
+ * `- connects to Msvm_SwitchPort
+ *    `- connects to Msvm_VirtualSwitch
+ *
+ * Example entry (shortened)
+ * -------------------------
+ * instance of Msvm_SyntheticEthernetPortSettingData
+ * {
+ *  Address = "00155D166100";
+ *  ...
+ *  Connection = {"\\\\WIN-S7J17Q4LBT7\\root\\virtualization:Msvm_SwitchPort.
+ *  CreationClassName=\"Msvm_SwitchPort\",
+ *  Name=\"30f5f685-d134-4bcf-9ed6-7ee704e1c934\",
+ *  SystemCreationClassName=\"Msvm_VirtualSwitch\",
+ *  SystemName=\"ef5a2166-337f-4b44-8141-7f6198fa1cda\""};
+ *  ...
+ * }
+ *
+ * instance of Msvm_SwitchPort
+ * {
+ *  ...
+ *  SystemName = "ef5a2166-337f-4b44-8141-7f6198fa1cda";
+ *  ...
+ * }
+ *
+ * instance of Msvm_VirtualSwitch
+ * {
+ *  ...
+ *  ElementName = "Name of Virtual Network";
+ *  ...
+ * }
+ */
+static int
+hypervParseDomainDefEthernet(virDomainDefPtr def,
+        Msvm_SyntheticEthernetPortSettingData *adapter,
+        hypervPrivate *priv)
+{
+    int result = -1;
+    virDomainNetDefPtr net = NULL;
+    virBuffer query = VIR_BUFFER_INITIALIZER;
+    Msvm_SwitchPort *switchPort = NULL;
+    Msvm_VirtualSwitch *virtualSwitch = NULL;
+    char *virtualSwitchId = NULL;
+    char *bridgeName = NULL;
+    char **msvmSwitchPortConnection = NULL;
+    char *switchPortConnectionEscaped = NULL;
+
+    VIR_DEBUG("Parsing device 'ethernet' (type %d)",
+            adapter->data->ResourceType);
+
+    if (adapter->data->Connection.count < 1) {
+        goto success;
+    }
+
+    if (VIR_ALLOC(net) < 0) {
+        goto cleanup;
+    }
+
+    net->type = VIR_DOMAIN_NET_TYPE_BRIDGE;
+    /* Set MAC address */
+    if (virMacAddrParseHex(adapter->data->Address, &net->mac) < 0) {
+        goto cleanup;
+    }
+
+    msvmSwitchPortConnection = adapter->data->Connection.data;
+    /* If the connection string is blank, the adapter isn't connected.
+     * Skip it and return success early.
+     */
+    if (*msvmSwitchPortConnection == NULL) {
+        VIR_DEBUG("Connection string is blank");
+        goto success;
+    }
+
+    /* Now we set the source parameter and bridge name. First we retrieve
+     * the Msvm_VirtualSwitch object associated with the SwitchPort, then we
+     * get the switch's name from that.
+     */
+    switchPortConnectionEscaped = virStringReplace(*msvmSwitchPortConnection,
+                                                   "\\", "\\\\");
+    switchPortConnectionEscaped = virStringReplace(switchPortConnectionEscaped,
+                                                  "\"", "\\\"");
+    virBufferAsprintf(&query,
+                      "select * from Msvm_SwitchPort where __PATH=\"%s\"",
+                      switchPortConnectionEscaped);
+
+    if (hypervGetMsvmSwitchPortList(priv, &query, &switchPort) < 0) {
+        VIR_DEBUG("Could not retrieve switch port.");
+        goto cleanup;
+    }
+
+    /* Now we use the port information to jump to the switch. */
+    virtualSwitchId = switchPort->data->SystemName;
+    virBufferFreeAndReset(&query);
+    virBufferAsprintf(&query,
+                      "select * from Msvm_VirtualSwitch "
+                      "where Name=\"%s\"",
+                      virtualSwitchId);
+    if (hypervGetMsvmVirtualSwitchList(priv, &query, &virtualSwitch) < 0) {
+        goto cleanup;
+    }
+
+    /* We finally have the object that has the bridge name in it! */
+    if (VIR_STRDUP(bridgeName, virtualSwitch->data->ElementName) < 0) {
+        goto cleanup;
+    }
+    net->data.bridge.brname = bridgeName;
+
+    if (VIR_APPEND_ELEMENT(def->nets, def->nnets, net) < 0) {
+        goto cleanup;
+    }
+
+success:
+    /* We did it! */
+    result = 0;
+
+cleanup:
+    if (switchPort) {
+        hypervFreeObject(priv, (hypervObject *) switchPort);
+    }
+    if (virtualSwitch) {
+        hypervFreeObject(priv, (hypervObject *) virtualSwitch);
+    }
+    virBufferFreeAndReset(&query);
+    return result;
+}
+
+/**
  * Generates the libvirt XML representation by filling the virDomainPtr struct.
  * 
  * For Hyper-V, this is done by querying WMI and mapping it to the libvirt 
@@ -1322,7 +1465,9 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
     Msvm_ProcessorSettingData *processorSettingData = NULL;
     Msvm_MemorySettingData *memorySettingData = NULL;
     Msvm_ResourceAllocationSettingData *rasdEntry = NULL;
-    Msvm_ResourceAllocationSettingData *rasdEntryListStart = NULL;    
+    Msvm_ResourceAllocationSettingData *rasdEntryListStart = NULL;
+    Msvm_SyntheticEthernetPortSettingData *ethernetAdapterData = NULL;
+    Msvm_SyntheticEthernetPortSettingData *ethernetAdapterListStart = NULL;
 
     /* Flags checked by virDomainDefFormat */
 
@@ -1415,10 +1560,23 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
         goto cleanup;
     }
 
+    /* Get Msvm_SyntheticEthernetPortSettingData (ethernet adapters of VM) */
+    virBufferFreeAndReset(&query);
+    virBufferAsprintf(&query,
+                      "associators of "
+                      "{Msvm_VirtualSystemSettingData.InstanceID=\"%s\"} "
+                      "where AssocClass = Msvm_VirtualSystemSettingDataComponent "
+                      "ResultClass = Msvm_SyntheticEthernetPortSettingData",
+                      virtualSystemSettingData->data->InstanceID);
+    if (hypervGetMsvmSyntheticEthernetPortSettingDataList(priv, &query,
+                                                    &ethernetAdapterData) < 0) {
+        goto cleanup;
+    }
+
     if (VIR_ALLOC_N(def->disks, 66) < 0) {
         goto cleanup;
     }
-        
+
     if (VIR_ALLOC_N(def->controllers, 66) < 0) {
         goto cleanup;
     }
@@ -1427,10 +1585,16 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
         goto cleanup;
     }
 
+    /* Hyper-V supports max 12 network interfaces per VM */
+    if (VIR_ALLOC_N(def->nets, 12) < 0) {
+        goto cleanup;
+    }
+
     def->ndisks = 0;
     def->ncontrollers = 0;
     def->nserials = 0;
-    
+    def->nnets = 0;
+
     /* Loop over all VM resources (RASD entries), and parse them depending
      * on the resource type. 
      *
@@ -1438,27 +1602,24 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
      * retrieve here actually represents a device tree through the 'Parent'
      * fields.
      */
-    
     rasdEntryListStart = rasdEntry;
 
     while (rasdEntry != NULL) {
         resourceType = rasdEntry->data->ResourceType;
-                
-        if (resourceType == 
+        if (resourceType ==
             MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_STORAGE_EXTENT) {
-            /* Get disk or CD/DVD drive backed by a file (VHD/ISO) */        
-            if (hypervParseDomainDefStorageExtent(domain, def, 
+            /* Get disk or CD/DVD drive backed by a file (VHD/ISO) */
+            if (hypervParseDomainDefStorageExtent(domain, def,
                                                   rasdEntry,
                                                   rasdEntryListStart,
                                                   &scsiDriveIndex) < 0) {
                 goto cleanup;
             }
         } else if (resourceType == MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_DISK) {
-            /* Get disk backed by a raw disk on the host */        
-            if (hypervParseDomainDefDisk(domain, def, rasdEntry, 
+            /* Get disk backed by a raw disk on the host */
+            if (hypervParseDomainDefDisk(domain, def, rasdEntry,
                                          rasdEntryListStart,
                                          &scsiDriveIndex) < 0) {
-                
                 goto cleanup;
             }
         } else if (resourceType ==
@@ -1468,8 +1629,23 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
                 goto cleanup;
             }
         }
-        
         rasdEntry = rasdEntry->next;
+    }
+
+    /* Loop over all VM ethernet devices and parse them. */
+    ethernetAdapterListStart = ethernetAdapterData;
+    while (ethernetAdapterData != NULL) {
+        if (ethernetAdapterData->data->ResourceType !=
+                MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_ETHERNET_ADAPTER) {
+            VIR_DEBUG("Invalid ethernet adapter type (%d)",
+                    ethernetAdapterData->data->ResourceType);
+        }
+        /* Add ethernet adapter */
+        if (hypervParseDomainDefEthernet(
+                    def, ethernetAdapterData, priv) < 0) {
+            goto cleanup;
+        }
+        ethernetAdapterData = ethernetAdapterData->next;
     }
 
     /* Fill struct */
@@ -1521,6 +1697,8 @@ hypervDomainGetXMLDesc(virDomainPtr domain, unsigned int flags)
     hypervFreeObject(priv, (hypervObject *)virtualSystemSettingData);
     hypervFreeObject(priv, (hypervObject *)processorSettingData);
     hypervFreeObject(priv, (hypervObject *)memorySettingData);
+    hypervFreeObject(priv, (hypervObject *)rasdEntryListStart);
+    hypervFreeObject(priv, (hypervObject *)ethernetAdapterListStart);
 
     return xml;
 }
