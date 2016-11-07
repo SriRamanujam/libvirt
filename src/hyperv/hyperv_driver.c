@@ -950,7 +950,7 @@ hypervParseDomainDefStorageExtent(
     char **connData;    
     hypervPrivate *priv = domain->conn->privateData;
     virDomainDiskDefPtr disk;
-    Msvm_ResourceAllocationSettingData *hddOrDvdParentRasdEntry = NULL;    
+    Msvm_ResourceAllocationSettingData *parentRasdEntry = NULL;    
 
     if (rasdEntry->data->Connection.count > 0) {
         VIR_DEBUG("Parsing device 'storage extent' (type %d)", 
@@ -961,13 +961,13 @@ hypervParseDomainDefStorageExtent(
 
         /* Find CD/DVD or HDD drive this entry is associated to */
         if (hypervParseDomainDefFindParentRasd(rasdEntry, rasdEntryListStart,
-                                               &hddOrDvdParentRasdEntry) < 0) {
+                                               &parentRasdEntry) < 0) {
             VIR_DEBUG("Cannot find parent CD/DVD/HDD drive. Skipping.");
             goto cleanup;
-        }    
+        }
 
-        /* Target (dst and bus) */
-        if (hypervParseDomainDefSetDiskTarget(disk, hddOrDvdParentRasdEntry,
+        /* Target (dst and bus) (except for floppy drives) */
+        if (hypervParseDomainDefSetDiskTarget(disk, parentRasdEntry,
             rasdEntryListStart, scsiDriveIndex) < 0) {
             VIR_DEBUG("Cannot set target. Skipping.");
             goto cleanup;
@@ -985,12 +985,16 @@ hypervParseDomainDefStorageExtent(
         }
         
         /* Device (CD/DVD or disk) */
-        switch (hddOrDvdParentRasdEntry->data->ResourceType) {
+        switch (parentRasdEntry->data->ResourceType) {
             case MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_CD_DRIVE:
             case MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_DVD_DRIVE:
                 disk->device = VIR_DOMAIN_DISK_DEVICE_CDROM;
                 break;
-                
+            case MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_FLOPPY:
+                disk->device = VIR_DOMAIN_DISK_DEVICE_FLOPPY;
+                disk->bus = VIR_DOMAIN_DISK_BUS_FDC;
+                disk->dst = virIndexToDiskName(0, "fd"); /* only one floppy drive per VM */
+                break;
             case MSVM_RESOURCEALLOCATIONSETTINGDATA_RESOURCETYPE_DISK:
             default:
                 disk->device = VIR_DOMAIN_DISK_DEVICE_DISK;
