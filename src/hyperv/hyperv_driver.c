@@ -3992,14 +3992,12 @@ hypervDomainDefineXML(virConnectPtr conn, const char *xml)
     }
 
     /* Set VM vcpus */
-    /*
-    if ((int)def->vcpus > 0) {
-        if (hypervDomainSetVcpus(domain, def->vcpus) < 0) {
+    if (def->vcpus != NULL) {
+        if (hypervDomainSetVcpus(domain, def->maxvcpus) < 0) {
             virReportError(VIR_ERR_INTERNAL_ERROR,
                            _("Could not set VM vCPUs"));
         }
     }
-    */
 
     /* Attach networks */
     for (i = 0; i < def->nnets; i++) {
