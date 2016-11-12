@@ -3633,11 +3633,12 @@ hypervGetSwitchPortPATH(virDomainPtr domain, char *switchPortName, char *virtual
  * FIXME:
  *   - implement associated detach method
  */
-ATTRIBUTE_UNUSED static int
-hypervDomainAttachNetwork(virDomainPtr domain, virDomainNetDefPtr net)
+static int
+hypervDomainAttachNetwork(virDomainPtr domain,
+        virDomainNetDefPtr net, char *hostName)
 {
     int result = -1, nb_params;
-    const char *selector1 = "CreationClassName=Msvm_VirtualSwitchManagementService";
+    char *selector1 = NULL;
     const char *selector2 = "CreationClassName=Msvm_VirtualSystemManagementService";
     char uuid_string[VIR_UUID_STRING_BUFLEN], guid_string[VIR_UUID_STRING_BUFLEN];
     unsigned char guid[VIR_UUID_BUFLEN];
@@ -3687,6 +3688,13 @@ hypervDomainAttachNetwork(virDomainPtr domain, virDomainNetDefPtr net)
     (*(params+3)).name = "ScopeOfResidence";
     (*(params+3)).type = SIMPLE_PARAM;
     (*(params+3)).param = &simpleparam3;
+
+    if (virAsprintf(&selector1,
+                          "CreationClassName=Msvm_VirtualSwitchManagementService&"
+                          "Name=nvspwmi&SystemCreationClassName=Msvm_ComputerSystem&"
+                          "SystemName=%s", hostName) < 0) {
+        goto cleanup;
+    }
 
     if (hypervInvokeMethod(priv, params, nb_params, "CreateSwitchPort",
                            MSVM_VIRTUALSWITCHMANAGEMENTSERVICE_RESOURCE_URI, selector1) < 0) {
@@ -3791,6 +3799,37 @@ hypervDomainAttachNetwork(virDomainPtr domain, virDomainNetDefPtr net)
     return result;
 }
 
+static int
+hypervGetHostSystem(hypervPrivate *priv, void **system)
+{
+    virBuffer query = VIR_BUFFER_INITIALIZER;
+    int result = -1;
+
+    virBufferAddLit(&query, MSVM_COMPUTERSYSTEM_WQL_SELECT);
+    virBufferAddLit(&query, "where ");
+    virBufferAddLit(&query, MSVM_COMPUTERSYSTEM_WQL_PHYSICAL);
+
+    if (strcmp(priv->hypervVersion, HYPERV_VERSION_2008) == 0) {
+        if (hypervGetMsvmComputerSystemList(priv, &query,
+                    (Msvm_ComputerSystem **) system) < 0) {
+            goto cleanup;
+        }
+    } else if (strcmp(priv->hypervVersion, HYPERV_VERSION_2012) == 0) {
+        if (hypervGetMsvmComputerSystem2012List(priv, &query,
+                    (Msvm_ComputerSystem_2012 **) system) < 0) {
+            goto cleanup;
+        }
+    }
+
+    if (*system == NULL) {
+        goto cleanup;
+    }
+
+    result = 0;
+cleanup:
+    return result;
+}
+
 
 static int
 hypervDomainAttachDeviceFlags(virDomainPtr domain, const char *xml,
@@ -3798,6 +3837,8 @@ hypervDomainAttachDeviceFlags(virDomainPtr domain, const char *xml,
 {
     int result = -1;
     hypervPrivate *priv = domain->conn->privateData;
+    Msvm_ComputerSystem *hostComputerSystem;
+    char *hostName = NULL;
     virDomainDefPtr def = NULL;
     virDomainDeviceDefPtr dev = NULL;
     char *xmlDomain = NULL;
@@ -3817,6 +3858,12 @@ hypervDomainAttachDeviceFlags(virDomainPtr domain, const char *xml,
         goto cleanup;
     }
 
+    /* Get the host computer system object for later use. */
+    if (hypervGetHostSystem(priv, (void **) &hostComputerSystem) < 0) {
+        goto cleanup;
+    }
+    hostName = hostComputerSystem->data->ElementName;
+
     switch (dev->type) {
         /* Device = disk */
         case VIR_DOMAIN_DEVICE_DISK:
@@ -3830,7 +3877,8 @@ hypervDomainAttachDeviceFlags(virDomainPtr domain, const char *xml,
 
         /* Device = network */
         case VIR_DOMAIN_DEVICE_NET:
-            if (hypervDomainAttachNetwork(domain, dev->data.net) < 0) {
+            if (hypervDomainAttachNetwork(domain, dev->data.net,
+                        hostName) < 0) {
                 virReportError(VIR_ERR_INTERNAL_ERROR,
                                _("Could not attach network"));
                 goto cleanup;
@@ -3867,6 +3915,8 @@ static virDomainPtr
 hypervDomainDefineXML(virConnectPtr conn, const char *xml)
 {
     hypervPrivate *priv = conn->privateData;
+    Msvm_ComputerSystem *hostComputerSystem = NULL;
+    char *hostName = NULL;
     virDomainDefPtr def = NULL;
     virDomainPtr domain = NULL;
     invokeXmlParam *params = NULL;
@@ -3881,6 +3931,13 @@ hypervDomainDefineXML(virConnectPtr conn, const char *xml)
                                        1 << VIR_DOMAIN_VIRT_HYPERV | VIR_DOMAIN_XML_INACTIVE)) == NULL) {
         goto cleanup;
     }
+
+    /* Get the host computer system object for later use. */
+    if (hypervGetHostSystem(priv, (void **) &hostComputerSystem) < 0) {
+        goto cleanup;
+    }
+
+    hostName = hostComputerSystem->data->ElementName;
 
     /* Create the domain if does not exist */
     if (def->uuid == NULL || (domain = hypervDomainLookupByUUID(conn, def->uuid)) == NULL) {
@@ -3946,7 +4003,7 @@ hypervDomainDefineXML(virConnectPtr conn, const char *xml)
 
     /* Attach networks */
     for (i = 0; i < def->nnets; i++) {
-        if (hypervDomainAttachNetwork(domain, def->nets[i]) < 0) {
+        if (hypervDomainAttachNetwork(domain, def->nets[i], hostName) < 0) {
             virReportError(VIR_ERR_INTERNAL_ERROR,
                            _("Could not attach network"));
         }
