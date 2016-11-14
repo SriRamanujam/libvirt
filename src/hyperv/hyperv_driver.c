@@ -3449,7 +3449,7 @@ hypervDomainSendKey(virDomainPtr domain,
                     unsigned int flags)
 {
     int result = -1, nb_params, i;
-    char *selector = NULL;    
+    char *selector = NULL;
     char uuid_string[VIR_UUID_STRING_BUFLEN];
     hypervPrivate *priv = domain->conn->privateData;
     virBuffer query = VIR_BUFFER_INITIALIZER;
@@ -3501,8 +3501,8 @@ hypervDomainSendKey(virDomainPtr domain,
             translatedKeyCodes[i] = keycode;
         }
     }
-        
-    if (virAsprintf(&selector, 
+
+    if (virAsprintf(&selector,
                     "CreationClassName=Msvm_Keyboard&DeviceID=%s&"
                     "SystemCreationClassName=Msvm_ComputerSystem&SystemName=%s",
                     keyboard->data->DeviceID, uuid_string) < 0)
@@ -3519,7 +3519,7 @@ hypervDomainSendKey(virDomainPtr domain,
         char keyCodeStr[sizeof(int)*3+2];
         snprintf(keyCodeStr, sizeof keyCodeStr, "%d", translatedKeyCodes[i]);
 
-		simpleparam.value = keyCodeStr;
+        simpleparam.value = keyCodeStr;
 
         (*params).name = "keyCode";
         (*params).type = SIMPLE_PARAM;
@@ -3535,7 +3535,7 @@ hypervDomainSendKey(virDomainPtr domain,
     }
 
     /* Hold keys (copied from vbox driver); since Hyper-V does not support
-	   holdtime, simulate it by sleeping and then sending the release keys */
+       holdtime, simulate it by sleeping and then sending the release keys */
     if (holdtime > 0)
         usleep(holdtime * 1000);
 
@@ -3550,7 +3550,7 @@ hypervDomainSendKey(virDomainPtr domain,
         char keyCodeStr[sizeof(int)*3+2];
         snprintf(keyCodeStr, sizeof keyCodeStr, "%d", translatedKeyCodes[i]);
 
-		simpleparam.value = keyCodeStr;
+        simpleparam.value = keyCodeStr;
 
         (*params).name = "keyCode";
         (*params).type = SIMPLE_PARAM;
@@ -3800,6 +3800,151 @@ hypervDomainAttachNetwork(virDomainPtr domain,
 }
 
 static int
+hypervDomainGetVirtualSystemSettingData(hypervPrivate *priv, const char *uuid,
+        Msvm_VirtualSystemSettingData **data)
+{
+    virBuffer query = VIR_BUFFER_INITIALIZER;
+    virBufferAsprintf(&query,
+                      "associators of "
+                      "{Msvm_ComputerSystem.CreationClassName=\"Msvm_ComputerSystem\","
+                      "Name=\"%s\"} "
+                      "where AssocClass = Msvm_SettingsDefineState "
+                      "ResultClass = Msvm_VirtualSystemSettingData",
+                      uuid);
+
+
+    if (hypervGetMsvmVirtualSystemSettingDataList(priv, &query, data) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
+hypervDomainGetResourceAllocationSettingData(hypervPrivate *priv,
+        const char *instanceID, Msvm_ResourceAllocationSettingData **data)
+{
+    virBuffer query = VIR_BUFFER_INITIALIZER;
+
+    virBufferAsprintf(&query,
+                      "associators of "
+                      "{Msvm_VirtualSystemSettingData.InstanceID=\"%s\"} "
+                      "where AssocClass = Msvm_VirtualSystemSettingDataComponent "
+                      "ResultClass = Msvm_ResourceAllocationSettingData",
+                      instanceID);
+
+    if (hypervGetMsvmResourceAllocationSettingDataList(priv, &query,
+                                                       data) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int
+hypervDomainAttachSerial(virDomainPtr domain,
+        virDomainChrDefPtr serial)
+{
+    int result = -1, nb_params;
+    const char *selector = "CreationClassName=Msvm_VirtualSystemManagementService";
+    char uuid_string[VIR_UUID_STRING_BUFLEN];
+    char *com_string = NULL;
+    hypervPrivate *priv = domain->conn->privateData;
+    virBuffer query = VIR_BUFFER_INITIALIZER;
+    virBuffer com_buffer = VIR_BUFFER_INITIALIZER;
+    invokeXmlParam *params = NULL;
+    eprParam eprparam;
+    embeddedParam embedded;
+    properties_t *tab_props = NULL;
+    Msvm_VirtualSystemSettingData *vList = NULL;
+    Msvm_ResourceAllocationSettingData *rasdList = NULL;
+    Msvm_ResourceAllocationSettingData *comPortSettingData = NULL; // iterator; do not free!
+
+    /* Initialization */
+    virUUIDFormat(domain->uuid, uuid_string);
+
+    virBufferAsprintf(&com_buffer, "COM %d", serial->target.port);
+    com_string = virBufferContentAndReset(&com_buffer);
+
+    VIR_DEBUG("serial device port=%s, path=%s, uuid=%s",
+            com_string, serial->source->data.file.path, uuid_string);
+
+    /* Go get the original COM port object for editing. */
+    if (hypervDomainGetVirtualSystemSettingData(priv, uuid_string, &vList) < 0) {
+        goto cleanup;
+    }
+    if (hypervDomainGetResourceAllocationSettingData(priv,
+                vList->data->InstanceID, &rasdList) < 0) {
+        goto cleanup;
+    }
+    /* iterate through list to find our COM port */
+    comPortSettingData = rasdList;
+    while (comPortSettingData != NULL) {
+        if (comPortSettingData->data->ResourceType == 17 &&
+            STREQ(comPortSettingData->data->ElementName, com_string)) {
+                /* Found our COM port */
+                break;
+            }
+        }
+        comPortSettingData = comPortSettingData->next;
+    }
+    if (comPortSettingData == NULL) {
+        goto cleanup;
+    }
+
+    /* Build ComputerSystem object ref for params */
+    virBufferAddLit(&query, MSVM_COMPUTERSYSTEM_WQL_SELECT);
+    virBufferAsprintf(&query, "where Name = \"%s\"", uuid_string);
+    eprparam.query = &query;
+    eprparam.wmiProviderURI = ROOT_VIRTUALIZATION;
+
+    /* Build embedded RASD param */
+    embedded.nbProps = 4;
+    if (VIR_ALLOC_N(tab_props, embedded.nbProps) < 0) {
+        goto cleanup;
+    }
+    (*tab_props).name = "Connection";
+    (*tab_props).val = serial->source->data.file.path;
+    (*(tab_props + 1)).name = "InstanceID";
+    (*(tab_props + 1)).val = comPortSettingData->data->InstanceID;
+    (*(tab_props + 2)).name = "ResourceType";
+    (*(tab_props + 2)).val = "17";
+    (*(tab_props + 3)).name = "ResourceSubType";
+    (*(tab_props + 3)).val = comPortSettingData->data->ResourceSubType;
+    embedded.instanceName = MSVM_RESOURCEALLOCATIONSETTINGDATA_CLASSNAME;
+    embedded.prop_t = tab_props;
+
+    /* Build params object and invoke */
+    nb_params = 2;
+    if (VIR_ALLOC_N(params, nb_params) < 0)
+        goto cleanup;
+
+    (*params).name = "ComputerSystem";
+    (*params).type = EPR_PARAM;
+    (*params).param = &eprparam;
+    (*(params + 1)).name = "ResourceSettingData";
+    (*(params + 1)).type = EMBEDDED_PARAM;
+    (*(params + 1)).param = &embedded;
+
+    if (hypervInvokeMethod(priv, params, nb_params, "ModifyVirtualSystemResources",
+                MSVM_VIRTUALSYSTEMMANAGEMENTSERVICE_RESOURCE_URI, selector) < 0) {
+        virReportError(VIR_ERR_INTERNAL_ERROR, "%s", _("Could not add serial device"));
+        goto cleanup;
+    }
+
+    result = 0;
+cleanup:
+    if (vList) {
+        hypervFreeObject(priv, (hypervObject *) vList);
+    }
+    if (rasdList) {
+        hypervFreeObject(priv, (hypervObject *) rasdList);
+    }
+    virBufferFreeAndReset(&com_buffer);
+    virBufferFreeAndReset(&query);
+    return result;
+}
+
+static int
 hypervGetHostSystem(hypervPrivate *priv, void **system)
 {
     virBuffer query = VIR_BUFFER_INITIALIZER;
@@ -3884,6 +4029,14 @@ hypervDomainAttachDeviceFlags(virDomainPtr domain, const char *xml,
                 goto cleanup;
             }
             VIR_DEBUG("Network attached");
+            break;
+        case VIR_DOMAIN_DEVICE_CHR:
+            if (hypervDomainAttachSerial(domain, dev->data.chr) < 0) {
+                virReportError(VIR_ERR_INTERNAL_ERROR,
+                        _("Could not attach serial device"));
+                goto cleanup;
+            }
+            VIR_DEBUG("Serial device attached");
             break;
 
         /* Unsupported device type */
@@ -4012,6 +4165,14 @@ hypervDomainDefineXML(virConnectPtr conn, const char *xml)
         if (hypervDomainAttachDisk(domain, def->disks[i]) < 0) {
             virReportError(VIR_ERR_INTERNAL_ERROR,
                            _("Could not attach disk"));
+        }
+    }
+
+    /* Attach serials */
+    for (i = 0; i < def->nserials; i++) {
+        if (hypervDomainAttachSerial(domain, def->serials[i]) < 0) {
+            virReportError(VIR_ERR_INTERNAL_ERROR,
+                    _("Could not attach serial device"));
         }
     }
 
